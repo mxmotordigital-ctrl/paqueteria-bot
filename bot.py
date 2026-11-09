@@ -20,7 +20,9 @@ Variables de entorno requeridas (definirlas en Render, NO quemarlas en el códig
 
 import json
 import os
+import re
 import sys
+import unicodedata
 
 import requests
 from flask import Flask, jsonify, request
@@ -70,7 +72,98 @@ def fetch_paqueteria_data():
         return "{}"
 
 
-def generate_response(user_message, paqueteria_json_text):
+def _norm(text):
+    """Minúsculas sin tildes para comparar nombres, guías y teléfonos."""
+    text = unicodedata.normalize("NFKD", str(text or "")).encode("ascii", "ignore").decode()
+    return re.sub(r"[^a-z0-9 ]", " ", text.lower())
+
+
+def _digits(text):
+    return re.sub(r"\D", "", str(text or ""))
+
+
+def filter_relevant_json(full_data, user_message, sender_id=None):
+    """Devuelve solo los envíos/paquetes que coinciden con lo que pide el usuario.
+
+    Prioridad:
+    1. Si el remitente (WhatsApp) coincide con un teléfono del JSON, solo sus envíos.
+    2. Si el mensaje menciona guía (ENV-2), nombre, teléfono, provincia o fecha, solo esos envíos.
+    3. Si menciona tarifas/precios/estados en general, devuelve contexto general sin clientes.
+    4. Si no filtra nada, devuelve todo para que Gemini responda lo que puede.
+
+    Esto evita que un cliente vea datos de otros y reduce tokens.
+    """
+    try:
+        envios = full_data.get("envios") or []
+
+        # 1) Coincidencia por remitente (solo WhatsApp tiene phone_number)
+        if sender_id:
+            sender_digits = _digits(sender_id)
+            if len(sender_digits) >= 7:
+                por_remitente = [
+                    e for e in envios
+                    if any(
+                        sender_digits in _digits(c.get("phone", "")) or sender_digits in _digits(c.get("recipient_phone", ""))
+                        for c in e.get("customers", [])
+                    )
+                ]
+                if por_remitente:
+                    return {**full_data, "envios": por_remitente}
+
+        # 2) Coincidencia por texto del mensaje
+        mensaje_norm = " " + _norm(user_message) + " "
+        mensaje_digits = _digits(user_message)
+        filtrados = []
+        for envio in envios:
+            texto_envio = " ".join([
+                str(envio.get("id", "")),
+                str(envio.get("date", "")),
+                str(envio.get("status", "")),
+            ]) + " " + " ".join(
+                f"{c.get('name','')} {c.get('recipient_name','')} {c.get('phone','')} {c.get('recipient_phone','')} {c.get('province','')} {c.get('origin_state','')}"
+                for c in envio.get("customers", [])
+            )
+            envio_norm = _norm(texto_envio)
+            # guía explícita ENV-2
+            if f"env {envio.get('id','')}" in mensaje_norm or f"envio {envio.get('id','')}" in mensaje_norm:
+                filtrados.append(envio)
+                continue
+            # coincidencia por teléfono mencionado
+            if mensaje_digits and any(
+                len(d) >= 7 and d in mensaje_digits
+                for d in [_digits(c.get("phone", "")), _digits(c.get("recipient_phone", ""))]
+                if d
+            ):
+                filtrados.append(envio)
+                continue
+            # coincidencia por nombre / provincia
+            for c in envio.get("customers", []):
+                for campo in [c.get("name", ""), c.get("recipient_name", ""), c.get("province", "")]:
+                    nombre = _norm(campo).strip()
+                    if len(nombre) >= 4 and nombre in mensaje_norm:
+                        filtrados.append(envio)
+                        break
+                else:
+                    continue
+                break
+
+        if filtrados:
+            return {**full_data, "envios": filtrados}
+
+        # 3) Pregunta general (tarifas, estados, categorías) -> contexto sin exponer todos los clientes
+        if any(p in mensaje_norm for p in ["tarifa", "precio", "cuesta", "vale", "estado", "categoria", "categorias", "documento", "miscelanea", "aseo", "comida", "peso", "kilo", "envios", "cuando", "fecha"]):
+            return {
+                "paqueteria": full_data.get("paqueteria", ""),
+                "precios": full_data.get("precios", {}),
+                "estados_posibles": full_data.get("estados_posibles", []),
+                "total_envios": len(envios),
+            }
+    except Exception as exc:
+        print(f"Filtro de JSON omitido: {exc}", file=sys.stderr)
+    return full_data
+
+
+def generate_response(user_message, paqueteria_json_text, sender_id=None):
     """Genera la respuesta usando Gemini Flash.
 
     Si Gemini falla (sin API key, red, cuota, etc.), devuelve una
@@ -85,13 +178,23 @@ def generate_response(user_message, paqueteria_json_text):
         print("ERROR: GEMINI_API_KEY no está definida.", file=sys.stderr)
         return fallback
     try:
+        # Filtrar el JSON según quién pregunta y qué pregunta.
+        try:
+            full_data = json.loads(paqueteria_json_text)
+            relevant_data = filter_relevant_json(full_data, user_message, sender_id)
+            relevant_text = json.dumps(relevant_data, ensure_ascii=False)
+        except Exception:
+            relevant_text = paqueteria_json_text
         # Prompt exacto exigido, con los datos del JSON insertados.
         prompt = (
             "Eres un asistente amable de una paquetería. "
             "El usuario pregunta sobre su envío. "
             "Responde basándote EXCLUSIVAMENTE en el siguiente JSON: "
-            f"{paqueteria_json_text}\n\n"
-            f"Mensaje del usuario: {user_message}"
+            f"{relevant_text}\n\n"
+            f"Mensaje del usuario: {user_message}\n\n"
+            "Responde solo con la información relevante para ESTE usuario y esta pregunta. "
+            "No muestres datos de otros clientes ni vuelques todo el JSON. "
+            "Sé breve y directo."
         )
         # Llamada REST directa a Gemini (sin grpcio) para no agotar la memoria free.
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
@@ -258,8 +361,8 @@ def webhook():
     # 1) Consultar la base de datos externa (JSON) y cargarla en memoria.
     paqueteria_data = fetch_paqueteria_data()
 
-    # 2) Procesar con Gemini Flash.
-    reply = generate_response(user_text, paqueteria_data)
+    # 2) Procesar con Gemini Flash (solo datos de este remitente / esta pregunta).
+    reply = generate_response(user_text, paqueteria_data, sender)
 
     # 3) Enviar la respuesta de vuelta por WhatsApp.
     send_whatsapp_message(sender, reply)
@@ -290,8 +393,8 @@ def telegram_webhook():
     # 1) Mismo JSON externo.
     paqueteria_data = fetch_paqueteria_data()
 
-    # 2) Mismo Gemini Flash.
-    reply = generate_response(user_text, paqueteria_data)
+    # 2) Mismo Gemini Flash (solo datos de esta pregunta).
+    reply = generate_response(user_text, paqueteria_data, None)
 
     # 3) Respuesta por Telegram.
     send_telegram_message(chat_id, reply)
