@@ -25,8 +25,6 @@ import sys
 import requests
 from flask import Flask, jsonify, request
 
-import google.generativeai as genai
-
 
 app = Flask(__name__)
 
@@ -87,9 +85,6 @@ def generate_response(user_message, paqueteria_json_text):
         print("ERROR: GEMINI_API_KEY no está definida.", file=sys.stderr)
         return fallback
     try:
-        genai.configure(api_key=GEMINI_API_KEY)
-        model = genai.GenerativeModel(GEMINI_MODEL)
-
         # Prompt exacto exigido, con los datos del JSON insertados.
         prompt = (
             "Eres un asistente amable de una paquetería. "
@@ -98,9 +93,21 @@ def generate_response(user_message, paqueteria_json_text):
             f"{paqueteria_json_text}\n\n"
             f"Mensaje del usuario: {user_message}"
         )
-
-        result = model.generate_content(prompt)
-        text = (getattr(result, "text", "") or "").strip()
+        # Llamada REST directa a Gemini (sin grpcio) para no agotar la memoria free.
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
+        response = requests.post(
+            url,
+            params={"key": GEMINI_API_KEY},
+            json={"contents": [{"parts": [{"text": prompt}]}]},
+            timeout=30,
+        )
+        response.raise_for_status()
+        data = response.json()
+        candidates = data.get("candidates") or []
+        if not candidates:
+            return fallback
+        parts = (candidates[0].get("content") or {}).get("parts") or []
+        text = "".join(part.get("text", "") for part in parts).strip()
         return text or fallback
     except Exception as exc:  # Gemini no puede romper el webhook
         print(f"ERROR en Gemini: {exc}", file=sys.stderr)
