@@ -22,6 +22,7 @@ import json
 import os
 import re
 import sys
+import time
 import unicodedata
 
 import requests
@@ -37,7 +38,7 @@ VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN")
 WHATSAPP_TOKEN = os.environ.get("WHATSAPP_TOKEN")
 PHONE_NUMBER_ID = os.environ.get("PHONE_NUMBER_ID")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-flash-latest")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 JSON_URL = os.environ.get("JSON_URL")
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 
@@ -197,14 +198,30 @@ def generate_response(user_message, paqueteria_json_text, sender_id=None):
             "Sé breve y directo."
         )
         # Llamada REST directa a Gemini (sin grpcio) para no agotar la memoria free.
+        # Llave por header (no por URL) para que no se filtre en logs. Reintento ante 429.
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
-        response = requests.post(
-            url,
-            params={"key": GEMINI_API_KEY},
-            json={"contents": [{"parts": [{"text": prompt}]}]},
-            timeout=30,
-        )
-        response.raise_for_status()
+        headers = {"x-goog-api-key": GEMINI_API_KEY, "Content-Type": "application/json"}
+        body = {"contents": [{"parts": [{"text": prompt}]}]}
+        response = None
+        last_exc = None
+        for attempt in range(3):
+            try:
+                response = requests.post(url, headers=headers, json=body, timeout=30)
+                if response.status_code not in (429, 500, 503):
+                    response.raise_for_status()
+                    break
+                if attempt == 2:
+                    response.raise_for_status()
+                wait = 2 * (attempt + 1) + (int(response.headers.get("Retry-After", "0") or 0) if response.headers.get("Retry-After") else 0)
+                print(f"Gemini {response.status_code}, reintentando en {wait}s (intento {attempt+1}/3)", file=sys.stderr)
+                time.sleep(wait)
+            except requests.RequestException as exc:
+                last_exc = exc
+                if attempt == 2:
+                    raise
+                time.sleep(2 * (attempt + 1))
+        if response is None:
+            raise last_exc or RuntimeError("Sin respuesta de Gemini")
         data = response.json()
         candidates = data.get("candidates") or []
         if not candidates:
