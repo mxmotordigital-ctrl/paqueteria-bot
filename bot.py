@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-Bot webhook para WhatsApp Cloud API (Meta) + Gemini 1.5 Flash.
+Bot webhook para WhatsApp Cloud API (Meta) + Telegram + Gemini 1.5 Flash.
 
 Pensado para desplegarse en Render.com (plan gratuito).
-Recibe mensajes por WhatsApp, consulta un JSON externo con los datos
-de la paquetería, genera una respuesta con Gemini y la devuelve
-por WhatsApp usando la API de Graph de Meta.
+Recibe mensajes por WhatsApp o Telegram, consulta un JSON externo con
+los datos de la paquetería, genera una respuesta con Gemini y la
+devuelve por el mismo canal.
 
 Variables de entorno requeridas (definirlas en Render, NO quemarlas en el código):
   - VERIFY_TOKEN     -> token de verificación del webhook de Meta
@@ -13,6 +13,7 @@ Variables de entorno requeridas (definirlas en Render, NO quemarlas en el códig
   - PHONE_NUMBER_ID  -> ID del número de teléfono remitente en Meta
   - GEMINI_API_KEY   -> API key de Google Gemini
   - JSON_URL         -> URL pública del JSON con la base de datos de paquetería
+  - TELEGRAM_TOKEN   -> token del bot de Telegram (de @BotFather)
   - PORT             -> puerto que asigna Render (por defecto 5000)
 """
 
@@ -36,6 +37,7 @@ WHATSAPP_TOKEN = os.environ.get("WHATSAPP_TOKEN")
 PHONE_NUMBER_ID = os.environ.get("PHONE_NUMBER_ID")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 JSON_URL = os.environ.get("JSON_URL")
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 
 # Versión de la API de Graph de Meta indicada en la consigna
 GRAPH_API_VERSION = "v17.0"
@@ -126,14 +128,35 @@ def send_whatsapp_message(to_number, message_text):
     try:
         response = requests.post(url, headers=headers, json=payload, timeout=10)
         response.raise_for_status()
-        print(f"Mensaje enviado a {to_number}: {response.status_code}")
+        print(f"Mensaje WhatsApp enviado a {to_number}: {response.status_code}")
     except requests.RequestException as exc:
         print(f"ERROR al enviar mensaje por WhatsApp: {exc}", file=sys.stderr)
     except Exception as exc:
         print(f"ERROR inesperado al enviar WhatsApp: {exc}", file=sys.stderr)
 
 
-def extract_sender_and_message(payload):
+def send_telegram_message(chat_id, message_text):
+    """Envía un mensaje de texto por la API oficial de Telegram Bot."""
+    if not TELEGRAM_TOKEN:
+        print("ERROR: TELEGRAM_TOKEN no está definida.", file=sys.stderr)
+        return
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": chat_id,
+        "text": message_text[:4096],  # límite de Telegram
+    }
+    try:
+        response = requests.post(url, json=payload, timeout=10)
+        response.raise_for_status()
+        print(f"Mensaje Telegram enviado a {chat_id}: {response.status_code}")
+    except requests.RequestException as exc:
+        print(f"ERROR al enviar mensaje por Telegram: {exc}", file=sys.stderr)
+    except Exception as exc:
+        print(f"ERROR inesperado al enviar Telegram: {exc}", file=sys.stderr)
+
+
+def extract_whatsapp_sender_and_message(payload):
     """Extrae (remitente, texto) del payload entrante de WhatsApp.
 
     Devuelve (None, None) si no hay mensaje de texto (ej. solo
@@ -157,7 +180,26 @@ def extract_sender_and_message(payload):
             return None, None
         return sender, user_text
     except (AttributeError, IndexError, TypeError) as exc:
-        print(f"ERROR al extraer mensaje: {exc}", file=sys.stderr)
+        print(f"ERROR al extraer mensaje de WhatsApp: {exc}", file=sys.stderr)
+        return None, None
+
+
+def extract_telegram_sender_and_message(payload):
+    """Extrae (chat_id, texto) del payload entrante de Telegram.
+
+    Telegram envía updates con message.chat.id y message.text
+    (también puede venir como edited_message).
+    """
+    try:
+        message = payload.get("message") or payload.get("edited_message") or {}
+        chat_id = str((message.get("chat") or {}).get("id") or "")
+        user_text = (message.get("text") or "").strip()
+
+        if not chat_id or not user_text:
+            return None, None
+        return chat_id, user_text
+    except (AttributeError, TypeError) as exc:
+        print(f"ERROR al extraer mensaje de Telegram: {exc}", file=sys.stderr)
         return None, None
 
 
@@ -167,9 +209,10 @@ def extract_sender_and_message(payload):
 @app.route("/", methods=["GET"])
 def home():
     """Ruta de salud para comprobar que el servicio está en línea en Render."""
-    return jsonify({"status": "ok", "service": "whatsapp-paquetria-bot"}), 200
+    return jsonify({"status": "ok", "service": "paquetria-bot", "whatsapp": True, "telegram": True}), 200
 
 
+# ----- WhatsApp (Meta) -----
 @app.route("/webhook", methods=["GET"])
 def verify_webhook():
     """Verificación estándar del webhook de Meta."""
@@ -197,11 +240,11 @@ def webhook():
         return jsonify({"status": "EVENT_RECEIVED"}), 200
 
     # Ignora actualizaciones de estado y eventos sin mensaje de texto.
-    sender, user_text = extract_sender_and_message(data)
+    sender, user_text = extract_whatsapp_sender_and_message(data)
     if sender is None or user_text is None:
         return jsonify({"status": "EVENT_RECEIVED"}), 200
 
-    print(f"Mensaje de {sender}: {user_text}")
+    print(f"Mensaje WhatsApp de {sender}: {user_text}")
 
     # 1) Consultar la base de datos externa (JSON) y cargarla en memoria.
     paqueteria_data = fetch_paqueteria_data()
@@ -213,6 +256,38 @@ def webhook():
     send_whatsapp_message(sender, reply)
 
     return jsonify({"status": "EVENT_RECEIVED"}), 200
+
+
+# ----- Telegram -----
+@app.route("/telegram-webhook", methods=["POST"])
+def telegram_webhook():
+    """Recibe mensajes de Telegram, responde con Gemini y devuelve.
+
+    Siempre responde 200 {"ok": true} aunque falle algo, para que
+    Telegram no reintente en bucle.
+    """
+    try:
+        data = request.get_json(silent=True) or {}
+    except Exception as exc:
+        print(f"ERROR: JSON inválido en telegram-webhook: {exc}", file=sys.stderr)
+        return jsonify({"ok": True}), 200
+
+    chat_id, user_text = extract_telegram_sender_and_message(data)
+    if chat_id is None or user_text is None:
+        return jsonify({"ok": True}), 200
+
+    print(f"Mensaje Telegram de {chat_id}: {user_text}")
+
+    # 1) Mismo JSON externo.
+    paqueteria_data = fetch_paqueteria_data()
+
+    # 2) Mismo Gemini 1.5 Flash.
+    reply = generate_response(user_text, paqueteria_data)
+
+    # 3) Respuesta por Telegram.
+    send_telegram_message(chat_id, reply)
+
+    return jsonify({"ok": True}), 200
 
 
 # ------------------------------------------------------------
