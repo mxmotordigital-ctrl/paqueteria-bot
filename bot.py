@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Bot webhook para WhatsApp Cloud API (Meta) + Telegram + Gemini 1.5 Flash.
+Bot webhook para WhatsApp Cloud API (Meta) + Telegram + Gemini Flash.
 
 Pensado para desplegarse en Render.com (plan gratuito).
 Recibe mensajes por WhatsApp o Telegram, consulta un JSON externo con
@@ -12,6 +12,7 @@ Variables de entorno requeridas (definirlas en Render, NO quemarlas en el códig
   - WHATSAPP_TOKEN   -> token de acceso de WhatsApp Cloud API
   - PHONE_NUMBER_ID  -> ID del número de teléfono remitente en Meta
   - GEMINI_API_KEY   -> API key de Google Gemini
+  - GEMINI_MODEL     -> modelo de Gemini (opcional, por defecto gemini-flash-latest)
   - JSON_URL         -> URL pública del JSON con la base de datos de paquetería
   - TELEGRAM_TOKEN   -> token del bot de Telegram (de @BotFather)
   - PORT             -> puerto que asigna Render (por defecto 5000)
@@ -36,6 +37,7 @@ VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN")
 WHATSAPP_TOKEN = os.environ.get("WHATSAPP_TOKEN")
 PHONE_NUMBER_ID = os.environ.get("PHONE_NUMBER_ID")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-flash-latest")
 JSON_URL = os.environ.get("JSON_URL")
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 
@@ -71,7 +73,7 @@ def fetch_paqueteria_data():
 
 
 def generate_response(user_message, paqueteria_json_text):
-    """Genera la respuesta usando Gemini 1.5 Flash.
+    """Genera la respuesta usando Gemini Flash.
 
     Si Gemini falla (sin API key, red, cuota, etc.), devuelve una
     respuesta de respaldo amigable en lugar de romper.
@@ -86,7 +88,7 @@ def generate_response(user_message, paqueteria_json_text):
         return fallback
     try:
         genai.configure(api_key=GEMINI_API_KEY)
-        model = genai.GenerativeModel("gemini-1.5-flash")
+        model = genai.GenerativeModel(GEMINI_MODEL)
 
         # Prompt exacto exigido, con los datos del JSON insertados.
         prompt = (
@@ -249,7 +251,7 @@ def webhook():
     # 1) Consultar la base de datos externa (JSON) y cargarla en memoria.
     paqueteria_data = fetch_paqueteria_data()
 
-    # 2) Procesar con Gemini 1.5 Flash.
+    # 2) Procesar con Gemini Flash.
     reply = generate_response(user_text, paqueteria_data)
 
     # 3) Enviar la respuesta de vuelta por WhatsApp.
@@ -281,7 +283,7 @@ def telegram_webhook():
     # 1) Mismo JSON externo.
     paqueteria_data = fetch_paqueteria_data()
 
-    # 2) Mismo Gemini 1.5 Flash.
+    # 2) Mismo Gemini Flash.
     reply = generate_response(user_text, paqueteria_data)
 
     # 3) Respuesta por Telegram.
