@@ -1,0 +1,64 @@
+{
+  "paqueteria": "ChatBot Paquetería",
+  "actualizado": "2026-11-09T03:22:44.084643+00:00",
+  "envios": [
+    {
+      "id": 2,
+      "date": "2026-11-30",
+      "capacity": 120.0,
+      "status": "Programado",
+      "collected": 13.0,
+      "remaining": 107.0,
+      "percent": 11,
+      "earnings": 0.0,
+      "customers": [
+        {
+          "id": 2,
+          "name": "Radamés Hernández",
+          "phone": "+52556798076",
+          "kilos": 13.0,
+          "origin_state": "Baja California",
+          "province": "La Habana",
+          "home_delivery": 0,
+          "recipient_name": "Clara Pérez",
+          "recipient_phone": "+5353740043",
+          "tariffed_products": false,
+          "customs_products": [],
+          "package_categories": [
+            "Documentos",
+            "Miscelánea",
+            "Aseo",
+            "Comida"
+          ],
+          "total_amount": 0.0
+        }
+      ]
+    }
+  ],
+  "clientes": [
+    {
+      "id": 2,
+      "name": "Radamés Hernández",
+      "phone": "+52556798076",
+      "shipment_count": 1,
+      "total_kilos": 13.0
+    }
+  ],
+  "administradores": [],
+  "precios": {
+    "shipping": {
+      "havana": 330.0,
+      "other_provinces": 380.0
+    },
+    "products": []
+  },
+  "estados_posibles": [
+    "Programado",
+    "Enviado a Cuba",
+    "Recibido en La Habana",
+    "En Distribución a Provincia",
+    "Recepcionado en Provincia",
+    "Entregada Completada"
+  ],
+  "instrucciones": "Eres un asistente amable de una paquetería. El usuario pregunta sobre su envío. Responde basándote EXCLUSIVAMENTE en el siguiente JSON: los datos completos de envíos, clientes, administradores y precios están en este payload. Si no encuentras al cliente o envío, di que no aparece registrado."
+}
