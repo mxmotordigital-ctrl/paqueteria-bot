@@ -796,7 +796,9 @@ def generate_response(
                 *history,
                 {"role": "user", "content": user_message},
             ],
-            "max_tokens": 1600,
+            # Techo muy alto: el modelo termina por su cuenta al acabar la
+            # respuesta. Solo evita que un fallo genere texto infinito.
+            "max_tokens": 8000,
         }
         response = asyncio.run(_post_openrouter_with_retry(url, headers, body))
         data = response.json()
