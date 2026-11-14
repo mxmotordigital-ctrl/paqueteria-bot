@@ -133,9 +133,24 @@ def _normalized_name(value):
     return " ".join(_norm(value).split())
 
 
+def _normalize_phone(text):
+    """Deja el teléfono en dígitos y quita el '1' de los móviles de México.
+
+    WhatsApp entrega los celulares mexicanos como 521 + 10 dígitos, pero en
+    el panel se guardan como 52 + 10 dígitos. Sin quitar ese '1' de en medio
+    ningún cliente mexicano coincide con su remitente.
+    """
+    digits = _digits(text)
+    # 52 1 XXXXXXXXXX -> 52 XXXXXXXXXX. El '1' va pegado al código de país,
+    # nunca es parte del código de área, así que quitarlo no confunde números.
+    if digits.startswith("52") and len(digits) > 2 and digits[2] == "1":
+        return digits[:2] + digits[3:]
+    return digits
+
+
 def _same_phone(phone_a, phone_b):
-    """Compara teléfonos completos, tolerando solo prefijos internacionales."""
-    a, b = _digits(phone_a), _digits(phone_b)
+    """Compara teléfonos completos, tolerando prefijos internacionales."""
+    a, b = _normalize_phone(phone_a), _normalize_phone(phone_b)
     if not a or not b:
         return False
     if a == b:
@@ -160,7 +175,7 @@ def validate_customer_name(full_data, supplied_name):
             unambiguous_partial = len(supplied_tokens) >= 2 and supplied_tokens.issubset(name_tokens)
             if exact_match or unambiguous_partial:
                 entry = matches.setdefault(normalized, {"name": display_name, "phones": set()})
-                phone = _digits(customer.get("phone"))
+                phone = _normalize_phone(customer.get("phone"))
                 if phone:
                     entry["phones"].add(phone)
     if len(matches) != 1:
