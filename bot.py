@@ -15,23 +15,17 @@ Variables de entorno requeridas (definirlas en Render, NO quemarlas en el códig
   - El modelo está fijado a google/gemini-3.8-flash
   - JSON_URL         -> URL pública del JSON con la base de datos de paquetería
   - TELEGRAM_TOKEN   -> token del bot de Telegram (de @BotFather)
-  - BOT_DASHBOARD_TOKEN -> clave Bearer para la bandeja de conversaciones del panel
-  - CHAT_DATABASE_PATH  -> (opcional) ruta SQLite; usa un disco persistente en hosting
   - PORT             -> puerto que asigna Render (por defecto 5000)
 """
 
 import asyncio
-from contextlib import contextmanager
-import hmac
 import json
 import os
 import re
-import sqlite3
 import sys
 import time
 import unicodedata
-from datetime import date, datetime, timezone
-from pathlib import Path
+from datetime import date, datetime
 
 import requests
 from flask import Flask, jsonify, request
@@ -49,11 +43,6 @@ OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY") or os.environ.get("GEM
 OPENROUTER_MODEL = "google/gemini-3.8-flash"
 JSON_URL = os.environ.get("JSON_URL")
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
-BOT_DASHBOARD_TOKEN = os.environ.get("BOT_DASHBOARD_TOKEN", "")
-CHAT_DATABASE_PATH = Path(
-    os.environ.get("CHAT_DATABASE_PATH", Path.cwd() / "whatsapp_chats.sqlite3")
-).expanduser()
-CHAT_DATABASE_PATH.parent.mkdir(parents=True, exist_ok=True)
 
 # Telegram no comparte el teléfono del usuario. La verificación por nombre se
 # mantiene por chat durante 12 horas; al reiniciar el servicio se pide de nuevo.
@@ -65,103 +54,6 @@ CONVERSATION_HISTORY = {}
 CONVERSATION_TTL = 12 * 60 * 60
 MAX_CONVERSATION_MESSAGES = 12
 PUBLIC_CONVERSATION_CONTEXT = {}
-
-
-def _chat_db():
-    connection = sqlite3.connect(CHAT_DATABASE_PATH, timeout=10)
-    if os.name != "nt":
-        try:
-            CHAT_DATABASE_PATH.chmod(0o600)
-        except OSError:
-            pass
-    connection.row_factory = sqlite3.Row
-    connection.execute("""
-        CREATE TABLE IF NOT EXISTS whatsapp_conversations (
-            phone TEXT PRIMARY KEY,
-            name TEXT NOT NULL DEFAULT '',
-            human_mode INTEGER NOT NULL DEFAULT 0,
-            updated_at TEXT NOT NULL
-        )
-    """)
-    connection.execute("""
-        CREATE TABLE IF NOT EXISTS whatsapp_messages (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            message_id TEXT UNIQUE,
-            phone TEXT NOT NULL,
-            direction TEXT NOT NULL,
-            text TEXT NOT NULL,
-            timestamp TEXT NOT NULL
-        )
-    """)
-    connection.execute(
-        "CREATE INDEX IF NOT EXISTS whatsapp_messages_phone ON whatsapp_messages(phone, id)"
-    )
-    return connection
-
-
-@contextmanager
-def chat_database():
-    db = _chat_db()
-    try:
-        yield db
-        db.commit()
-    except Exception:
-        db.rollback()
-        raise
-    finally:
-        db.close()
-
-
-def record_whatsapp_message(phone, direction, text, message_id=None, timestamp=None):
-    phone = re.sub(r"\D", "", str(phone or ""))
-    text = str(text or "").strip()[:4096]
-    if not phone or not text:
-        return
-    timestamp = timestamp or datetime.now(timezone.utc).isoformat()
-    with chat_database() as db:
-        db.execute("""
-            INSERT OR IGNORE INTO whatsapp_conversations(phone, updated_at)
-            VALUES (?, ?)
-        """, (phone, timestamp))
-        inserted = db.execute("""
-            INSERT OR IGNORE INTO whatsapp_messages(message_id, phone, direction, text, timestamp)
-            VALUES (?, ?, ?, ?, ?)
-        """, (message_id, phone, direction, text, timestamp))
-        if inserted.rowcount == 0:
-            return False
-        db.execute(
-            "UPDATE whatsapp_conversations SET updated_at = ? WHERE phone = ?",
-            (timestamp, phone),
-        )
-        db.execute("""
-            DELETE FROM whatsapp_messages
-            WHERE phone = ? AND id NOT IN (
-                SELECT id FROM whatsapp_messages WHERE phone = ?
-                ORDER BY id DESC LIMIT 500
-            )
-        """, (phone, phone))
-    return True
-
-
-def _whatsapp_auth_required():
-    supplied = request.headers.get("Authorization", "")
-    token = supplied[7:] if supplied.lower().startswith("bearer ") else ""
-    return bool(BOT_DASHBOARD_TOKEN) and hmac.compare_digest(token, BOT_DASHBOARD_TOKEN)
-
-
-def _format_message_time(timestamp):
-    try:
-        return datetime.fromisoformat(timestamp.replace("Z", "+00:00")).astimezone().strftime("%d/%m %H:%M")
-    except (TypeError, ValueError):
-        return timestamp
-
-
-def _human_mode(phone):
-    with chat_database() as db:
-        row = db.execute(
-            "SELECT human_mode FROM whatsapp_conversations WHERE phone = ?", (phone,)
-        ).fetchone()
-        return bool(row["human_mode"]) if row else False
 
 # Instrucciones por defecto si el JSON no trae un prompt del negocio configurado.
 MAX_BUSINESS_PROMPT_LENGTH = 8000
@@ -315,7 +207,7 @@ def public_data_for_model(full_data):
         ],
         "administradores": full_data.get("administradores", []),
         "estados_posibles": full_data.get("estados_posibles", []),
-        "instrucciones": full_data.get("prompt_negocio") or full_data.get("instrucciones", ""),
+        "instrucciones": full_data.get("instrucciones", ""),
     }
 
 
@@ -989,7 +881,7 @@ def send_whatsapp_message(to_number, message_text):
             "ERROR: faltan WHATSAPP_TOKEN o PHONE_NUMBER_ID, no se envía el mensaje.",
             file=sys.stderr,
         )
-        return False
+        return
 
     url = f"https://graph.facebook.com/{GRAPH_API_VERSION}/{PHONE_NUMBER_ID}/messages"
     headers = {
@@ -1012,18 +904,15 @@ def send_whatsapp_message(to_number, message_text):
                 f"{response.text[:800]}",
                 file=sys.stderr,
             )
-            return False
+            return
         print(
             f"Mensaje WhatsApp enviado: {response.status_code} "
             f"a ...{str(to_number)[-4:]}"
         )
-        return True
     except requests.RequestException as exc:
         print(f"ERROR al enviar mensaje por WhatsApp: {exc}", file=sys.stderr)
-        return False
     except Exception as exc:
         print(f"ERROR inesperado al enviar WhatsApp: {exc}", file=sys.stderr)
-        return False
 
 
 def send_telegram_message(chat_id, message_text):
@@ -1107,100 +996,6 @@ def home():
     return jsonify({"status": "ok", "service": "paquetria-bot", "whatsapp": True, "telegram": True}), 200
 
 
-@app.route("/admin/conversations", methods=["GET"])
-def admin_conversations():
-    if not _whatsapp_auth_required():
-        return jsonify({"error": "No autorizado"}), 401
-    try:
-        with chat_database() as db:
-            rows = db.execute("""
-                SELECT c.phone, c.name, c.human_mode, c.updated_at,
-                       (SELECT text FROM whatsapp_messages m WHERE m.phone = c.phone
-                        ORDER BY m.id DESC LIMIT 1) AS last_message
-                FROM whatsapp_conversations c ORDER BY c.updated_at DESC LIMIT 200
-            """).fetchall()
-        return jsonify({"conversations": [
-            {
-                "phone": row["phone"],
-                "name": row["name"],
-                "human_mode": bool(row["human_mode"]),
-                "last_message": row["last_message"] or "",
-                "updated_at": _format_message_time(row["updated_at"]),
-            }
-            for row in rows
-        ]})
-    except Exception as exc:
-        print(f"ERROR listando conversaciones: {exc}", file=sys.stderr)
-        return jsonify({"error": "No se pudieron cargar las conversaciones."}), 500
-
-
-@app.route("/admin/conversations/<phone>", methods=["GET"])
-def admin_conversation(phone):
-    if not _whatsapp_auth_required():
-        return jsonify({"error": "No autorizado"}), 401
-    phone = re.sub(r"\D", "", phone)
-    if not phone:
-        return jsonify({"error": "Número no válido"}), 400
-    with chat_database() as db:
-        conversation = db.execute(
-            "SELECT human_mode FROM whatsapp_conversations WHERE phone = ?", (phone,)
-        ).fetchone()
-        rows = db.execute("""
-            SELECT direction, text, timestamp FROM whatsapp_messages
-            WHERE phone = ? ORDER BY id DESC LIMIT 200
-        """, (phone,)).fetchall()
-    return jsonify({
-        "phone": phone,
-        "human_mode": bool(conversation["human_mode"]) if conversation else False,
-        "messages": [
-            {
-                "direction": row["direction"],
-                "text": row["text"],
-                "timestamp": _format_message_time(row["timestamp"]),
-            }
-            for row in reversed(rows)
-        ],
-    })
-
-
-@app.route("/admin/control", methods=["POST"])
-def admin_chat_control():
-    if not _whatsapp_auth_required():
-        return jsonify({"error": "No autorizado"}), 401
-    data = request.get_json(silent=True) or {}
-    phone = re.sub(r"\D", "", str(data.get("phone") or ""))
-    enabled = data.get("enabled")
-    if not phone or not isinstance(enabled, bool):
-        return jsonify({"error": "Indica una conversación y un modo válido."}), 400
-    with chat_database() as db:
-        db.execute(
-            "INSERT OR IGNORE INTO whatsapp_conversations(phone, updated_at) VALUES (?, ?)",
-            (phone, datetime.now(timezone.utc).isoformat()),
-        )
-        db.execute(
-            "UPDATE whatsapp_conversations SET human_mode = ? WHERE phone = ?",
-            (int(enabled), phone),
-        )
-    return jsonify({"ok": True, "phone": phone, "human_mode": enabled})
-
-
-@app.route("/admin/send", methods=["POST"])
-def admin_send_message():
-    if not _whatsapp_auth_required():
-        return jsonify({"error": "No autorizado"}), 401
-    data = request.get_json(silent=True) or {}
-    phone = re.sub(r"\D", "", str(data.get("phone") or ""))
-    text = str(data.get("text") or "").strip()
-    if not phone or not text or len(text) > 4096:
-        return jsonify({"error": "Escribe un número y un mensaje válido."}), 400
-    if not _human_mode(phone):
-        return jsonify({"error": "Activa la intervención manual antes de responder."}), 409
-    if not send_whatsapp_message(phone, text):
-        return jsonify({"error": "Meta no pudo enviar el mensaje."}), 502
-    record_whatsapp_message(phone, "out", text)
-    return jsonify({"ok": True})
-
-
 # ----- WhatsApp (Meta) -----
 @app.route("/webhook", methods=["GET"])
 def verify_webhook():
@@ -1233,30 +1028,6 @@ def webhook():
     sender, user_text = extract_whatsapp_sender_and_message(data)
     if sender is None or user_text is None:
         return jsonify({"status": "EVENT_RECEIVED"}), 200
-    message = (((data.get("entry") or [{}])[0].get("changes") or [{}])[0]
-               .get("value", {}).get("messages") or [{}])[0]
-    timestamp = message.get("timestamp")
-    try:
-        message_time = datetime.fromtimestamp(int(timestamp), timezone.utc).isoformat()
-    except (TypeError, ValueError, OverflowError):
-        message_time = datetime.now(timezone.utc).isoformat()
-    phone = _digits(sender)
-    recorded = record_whatsapp_message(
-        phone, "in", user_text, message_id=message.get("id"), timestamp=message_time
-    )
-    if not recorded:
-        return jsonify({"status": "EVENT_RECEIVED", "duplicate": True}), 200
-    contact = (((data.get("entry") or [{}])[0].get("changes") or [{}])[0]
-               .get("value", {}).get("contacts") or [{}])
-    display_name = str((contact[0].get("profile") or {}).get("name") or "") if contact else ""
-    if display_name:
-        with chat_database() as db:
-            db.execute(
-                "UPDATE whatsapp_conversations SET name = ? WHERE phone = ?",
-                (display_name[:120], phone),
-            )
-    if _human_mode(phone):
-        return jsonify({"status": "EVENT_RECEIVED", "attention": "human"}), 200
 
     # La identidad de WhatsApp se valida únicamente con el teléfono del cliente,
     # nunca con el teléfono del destinatario.
@@ -1279,8 +1050,7 @@ def webhook():
     if not reply:
         reply = _general_help_reply()
 
-    if not _human_mode(phone) and send_whatsapp_message(sender, reply):
-        record_whatsapp_message(phone, "out", reply)
+    send_whatsapp_message(sender, reply)
 
     return jsonify({"status": "EVENT_RECEIVED"}), 200
 
