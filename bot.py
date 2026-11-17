@@ -22,6 +22,7 @@ import asyncio
 import json
 import os
 import re
+import sqlite3
 import sys
 import time
 import unicodedata
@@ -43,6 +44,11 @@ OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY") or os.environ.get("GEM
 OPENROUTER_MODEL = "google/gemini-3.8-flash"
 JSON_URL = os.environ.get("JSON_URL")
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
+WHATSAPP_DEDUPE_DB_PATH = os.environ.get("WHATSAPP_DEDUPE_DB_PATH") or os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "whatsapp_dedupe.sqlite3"
+)
+WHATSAPP_DEDUPE_RETENTION_SECONDS = 7 * 24 * 60 * 60
+WHATSAPP_DEDUPE_PROCESSING_LEASE_SECONDS = 5 * 60
 
 # Telegram no comparte el teléfono del usuario. La verificación por nombre se
 # mantiene por chat durante 12 horas; al reiniciar el servicio se pide de nuevo.
@@ -598,6 +604,42 @@ def public_information_reply(full_data, message, conversation_id):
         "cuanto valen", "cuanto cobran", "cuanto es", "tarifa", "tarifas",
         "costo", "coste", "vale", "cobran",
     ))
+    device_names = {
+        "celulares": ("celular", "celulares", "movil", "moviles"),
+        "tablets": ("tablet", "tablets", "tableta", "tabletas"),
+        "laptop": ("laptop", "laptops", "portatil", "portatiles"),
+    }
+    requested_devices = [
+        (device, label)
+        for device, aliases in device_names.items()
+        if any(alias in normalized for alias in aliases)
+        for label in (device.capitalize(),)
+    ]
+    if not private_intent and price_terms and requested_devices:
+        device_prices = ((full_data.get("precios") or {}).get("devices") or {})
+        if provinces:
+            destinations = []
+            for province in provinces:
+                price_type = "havana" if _normalized_name(province) == "la habana" else "other_provinces"
+                if price_type not in [entry[0] for entry in destinations]:
+                    destinations.append((price_type, province))
+        elif mentions_other_provinces:
+            destinations = [("other_provinces", "el resto de las provincias")]
+        else:
+            destinations = [("havana", "La Habana"), ("other_provinces", "el resto de las provincias")]
+        replies = [admin_reply] if admin_reply else []
+        for device, label in requested_devices:
+            prices = device_prices.get(device) or {}
+            entries = [
+                f"{destination}: {_format_mxn(prices.get(price_type))}"
+                for price_type, destination in destinations
+                if _format_mxn(prices.get(price_type))
+            ]
+            if entries:
+                replies.append(f"Precio de {label.lower()}: " + "; ".join(entries) + ".")
+            else:
+                replies.append(f"No tengo precios registrados para {label.lower()} por ahora.")
+        return "\n".join(replies)
     asks_unit = any(term in normalized for term in (
         "por kilo", "por kg", "por kilogramo", "el kilo", "el kilogramo",
         "por cada kilo", "por cada kilogramo",
@@ -857,6 +899,7 @@ def _log_whatsapp_event(payload):
                     print(
                         f"[WA] mensaje entrante de ...{str(msg.get('from'))[-4:]}"
                         f" tipo={msg.get('type')}"
+                        f" id=...{str(msg.get('id') or '')[-12:]}"
                     )
                 for status in value.get("statuses") or []:
                     detail = ""
@@ -964,6 +1007,102 @@ def extract_whatsapp_sender_and_message(payload):
         return None, None
 
 
+def extract_whatsapp_message_id(payload):
+    """Extrae el ID único (wamid) del primer mensaje de WhatsApp."""
+    try:
+        entry = (payload.get("entry") or [{}])[0]
+        changes = entry.get("changes") or [{}]
+        value = changes[0].get("value") or {}
+        messages = value.get("messages") or []
+        return str((messages[0] or {}).get("id") or "").strip()
+    except (AttributeError, IndexError, TypeError):
+        return ""
+
+
+def _claim_whatsapp_message(message_id):
+    """Reclama un mensaje una sola vez, incluso con workers concurrentes."""
+    if not message_id:
+        return True
+
+    now = time.time()
+    try:
+        db_path = os.path.abspath(WHATSAPP_DEDUPE_DB_PATH)
+        os.makedirs(os.path.dirname(db_path), exist_ok=True)
+        with sqlite3.connect(db_path, timeout=10) as db:
+            db.execute("PRAGMA busy_timeout = 10000")
+            db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS whatsapp_webhook_messages (
+                    message_id TEXT PRIMARY KEY,
+                    state TEXT NOT NULL,
+                    updated_at REAL NOT NULL
+                )
+                """
+            )
+            cursor = db.execute(
+                """
+                INSERT OR IGNORE INTO whatsapp_webhook_messages
+                    (message_id, state, updated_at)
+                VALUES (?, 'processing', ?)
+                """,
+                (message_id, now),
+            )
+            if cursor.rowcount == 1:
+                claimed = True
+            else:
+                existing = db.execute(
+                    "SELECT state, updated_at FROM whatsapp_webhook_messages "
+                    "WHERE message_id = ?",
+                    (message_id,),
+                ).fetchone()
+                if not existing or existing[0] == "done":
+                    claimed = False
+                elif now - existing[1] < WHATSAPP_DEDUPE_PROCESSING_LEASE_SECONDS:
+                    claimed = False
+                else:
+                    cursor = db.execute(
+                        """
+                        UPDATE whatsapp_webhook_messages
+                        SET updated_at = ?
+                        WHERE message_id = ? AND state = 'processing' AND updated_at = ?
+                        """,
+                        (now, message_id, existing[1]),
+                    )
+                    claimed = cursor.rowcount == 1
+
+            db.execute(
+                """
+                DELETE FROM whatsapp_webhook_messages
+                WHERE state = 'done' AND updated_at < ?
+                """,
+                (now - WHATSAPP_DEDUPE_RETENTION_SECONDS,),
+            )
+            return claimed
+    except (OSError, sqlite3.Error) as exc:
+        # Fail open para no dejar de responder si el almacenamiento falla.
+        print(f"[WA] error en deduplicación; se procesa el mensaje: {exc}", file=sys.stderr)
+        return True
+
+
+def _complete_whatsapp_message(message_id):
+    """Marca como procesado el mensaje tras intentar enviar su respuesta."""
+    if not message_id:
+        return
+    try:
+        with sqlite3.connect(WHATSAPP_DEDUPE_DB_PATH, timeout=10) as db:
+            db.execute("PRAGMA busy_timeout = 10000")
+            db.execute(
+                """
+                UPDATE whatsapp_webhook_messages
+                SET state = 'done', updated_at = ?
+                WHERE message_id = ?
+                """,
+                (time.time(), message_id),
+            )
+    except (OSError, sqlite3.Error) as exc:
+        print(f"[WA] no se pudo guardar el mensaje procesado: {exc}", file=sys.stderr)
+
+
 def extract_telegram_sender_and_message(payload):
     """Extrae (chat_id, texto) del payload entrante de Telegram.
 
@@ -1029,6 +1168,11 @@ def webhook():
     if sender is None or user_text is None:
         return jsonify({"status": "EVENT_RECEIVED"}), 200
 
+    message_id = extract_whatsapp_message_id(data)
+    if not _claim_whatsapp_message(message_id):
+        print(f"[WA] evento duplicado ignorado id=...{message_id[-12:]}")
+        return jsonify({"status": "EVENT_RECEIVED"}), 200
+
     # La identidad de WhatsApp se valida únicamente con el teléfono del cliente,
     # nunca con el teléfono del destinatario.
     try:
@@ -1051,6 +1195,7 @@ def webhook():
         reply = _general_help_reply()
 
     send_whatsapp_message(sender, reply)
+    _complete_whatsapp_message(message_id)
 
     return jsonify({"status": "EVENT_RECEIVED"}), 200
 
