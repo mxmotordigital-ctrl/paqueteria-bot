@@ -15,10 +15,12 @@ Variables de entorno requeridas (definirlas en Render, NO quemarlas en el códig
   - El modelo está fijado a google/gemini-3.8-flash
   - JSON_URL         -> URL pública del JSON con la base de datos de paquetería
   - TELEGRAM_TOKEN   -> token del bot de Telegram (de @BotFather)
+  - INBOX_API_TOKEN  -> secreto para consultar/responder mensajes desde el panel local
   - PORT             -> puerto que asigna Render (por defecto 5000)
 """
 
 import asyncio
+import hmac
 import json
 import os
 import re
@@ -44,9 +46,11 @@ OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY") or os.environ.get("GEM
 OPENROUTER_MODEL = "google/gemini-3.8-flash"
 JSON_URL = os.environ.get("JSON_URL")
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
+INBOX_API_TOKEN = os.environ.get("INBOX_API_TOKEN", "")
 WHATSAPP_DEDUPE_DB_PATH = os.environ.get("WHATSAPP_DEDUPE_DB_PATH") or os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "whatsapp_dedupe.sqlite3"
 )
+WHATSAPP_INBOX_DB_PATH = os.environ.get("WHATSAPP_INBOX_DB_PATH") or WHATSAPP_DEDUPE_DB_PATH
 WHATSAPP_DEDUPE_RETENTION_SECONDS = 7 * 24 * 60 * 60
 WHATSAPP_DEDUPE_PROCESSING_LEASE_SECONDS = 5 * 60
 
@@ -918,13 +922,14 @@ def _log_whatsapp_event(payload):
 
 
 def send_whatsapp_message(to_number, message_text):
-    """Envía un mensaje de texto por WhatsApp Cloud API (Graph de Meta)."""
+    """Envía texto y devuelve el ID de Meta o el error de envío."""
     if not WHATSAPP_TOKEN or not PHONE_NUMBER_ID:
+        error = "Faltan WHATSAPP_TOKEN o PHONE_NUMBER_ID."
         print(
-            "ERROR: faltan WHATSAPP_TOKEN o PHONE_NUMBER_ID, no se envía el mensaje.",
+            f"ERROR: {error} No se envía el mensaje.",
             file=sys.stderr,
         )
-        return
+        return {"message_id": None, "error": error}
 
     url = f"https://graph.facebook.com/{GRAPH_API_VERSION}/{PHONE_NUMBER_ID}/messages"
     headers = {
@@ -947,15 +952,30 @@ def send_whatsapp_message(to_number, message_text):
                 f"{response.text[:800]}",
                 file=sys.stderr,
             )
-            return
+            try:
+                error = response.json().get("error", {}).get("message")
+            except (ValueError, AttributeError):
+                error = None
+            return {
+                "message_id": None,
+                "error": error or f"WhatsApp devolvió HTTP {response.status_code}.",
+            }
+        try:
+            messages = response.json().get("messages") or []
+            provider_message_id = (messages[0] or {}).get("id") if messages else None
+        except (ValueError, AttributeError, IndexError, TypeError):
+            provider_message_id = None
         print(
             f"Mensaje WhatsApp enviado: {response.status_code} "
             f"a ...{str(to_number)[-4:]}"
         )
+        return {"message_id": provider_message_id, "error": None}
     except requests.RequestException as exc:
         print(f"ERROR al enviar mensaje por WhatsApp: {exc}", file=sys.stderr)
+        return {"message_id": None, "error": "No se pudo conectar con WhatsApp."}
     except Exception as exc:
         print(f"ERROR inesperado al enviar WhatsApp: {exc}", file=sys.stderr)
+        return {"message_id": None, "error": "Ocurrió un error al enviar por WhatsApp."}
 
 
 def send_telegram_message(chat_id, message_text):
@@ -1103,6 +1123,133 @@ def _complete_whatsapp_message(message_id):
         print(f"[WA] no se pudo guardar el mensaje procesado: {exc}", file=sys.stderr)
 
 
+def _inbox_connect():
+    db_path = os.path.abspath(WHATSAPP_INBOX_DB_PATH)
+    os.makedirs(os.path.dirname(db_path), exist_ok=True)
+    db = sqlite3.connect(db_path, timeout=10)
+    db.row_factory = sqlite3.Row
+    db.execute("PRAGMA busy_timeout = 10000")
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS whatsapp_inbox_messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            provider_message_id TEXT UNIQUE,
+            phone TEXT NOT NULL,
+            direction TEXT NOT NULL CHECK(direction IN ('inbound', 'outbound')),
+            text TEXT NOT NULL,
+            status TEXT NOT NULL,
+            created_at REAL NOT NULL
+        )
+    """)
+    db.execute(
+        "CREATE INDEX IF NOT EXISTS whatsapp_inbox_phone_id "
+        "ON whatsapp_inbox_messages(phone, id)"
+    )
+    return db
+
+
+def _store_whatsapp_inbox_message(
+    phone, direction, text, provider_message_id=None, status="received"
+):
+    try:
+        with _inbox_connect() as db:
+            db.execute("""
+                INSERT OR IGNORE INTO whatsapp_inbox_messages
+                    (provider_message_id, phone, direction, text, status, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (
+                provider_message_id, _digits(phone), direction,
+                str(text or "")[:4096], status, time.time(),
+            ))
+    except (OSError, sqlite3.Error) as exc:
+        print(f"[WA] no se pudo guardar un mensaje en la bandeja: {exc}", file=sys.stderr)
+
+
+def _store_nontext_whatsapp_messages(payload):
+    """Conserva en la bandeja archivos/ubicaciones aunque el asistente no los procese."""
+    labels = {
+        "image": "El cliente envió una imagen.",
+        "audio": "El cliente envió un audio.",
+        "video": "El cliente envió un video.",
+        "sticker": "El cliente envió un sticker.",
+        "location": "El cliente compartió una ubicación.",
+        "contacts": "El cliente compartió un contacto.",
+        "document": "El cliente envió un documento.",
+    }
+    try:
+        for entry in payload.get("entry") or []:
+            for change in entry.get("changes") or []:
+                value = change.get("value") or {}
+                for message in value.get("messages") or []:
+                    if ((message.get("text") or {}).get("body") or "").strip():
+                        continue
+                    phone = str(message.get("from") or "")
+                    if not phone:
+                        continue
+                    message_id = str(message.get("id") or "").strip()
+                    if message_id and not _claim_whatsapp_message(message_id):
+                        continue
+                    message_type = str(message.get("type") or "unknown")
+                    description = labels.get(
+                        message_type,
+                        f"El cliente envió un mensaje de tipo {message_type}.",
+                    )
+                    if message_type == "document":
+                        filename = str(
+                            (message.get("document") or {}).get("filename") or ""
+                        ).strip()
+                        if filename:
+                            description = f"El cliente envió un documento: {filename}"
+                    _store_whatsapp_inbox_message(
+                        phone, "inbound", description,
+                        provider_message_id=message_id or None,
+                    )
+                    _complete_whatsapp_message(message_id)
+    except (AttributeError, TypeError) as exc:
+        print(f"[WA] no se pudo registrar contenido no textual: {exc}", file=sys.stderr)
+
+
+def _inbox_authorization_error():
+    if not INBOX_API_TOKEN:
+        return jsonify({"error": "La API de la bandeja no está configurada."}), 503
+    supplied = request.headers.get("Authorization", "")
+    expected = f"Bearer {INBOX_API_TOKEN}"
+    if not hmac.compare_digest(supplied.encode("utf-8"), expected.encode("utf-8")):
+        return jsonify({"error": "No autorizado."}), 401
+    return None
+
+
+def _whatsapp_inbox_conversations():
+    with _inbox_connect() as db:
+        rows = db.execute("""
+            SELECT message.phone, message.text AS last_message,
+                   message.direction AS last_direction,
+                   message.status AS last_status,
+                   message.created_at AS last_at,
+                   (SELECT COUNT(*) FROM whatsapp_inbox_messages incoming
+                    WHERE incoming.phone = message.phone) AS message_count
+            FROM whatsapp_inbox_messages message
+            WHERE message.id = (
+                SELECT MAX(latest.id) FROM whatsapp_inbox_messages latest
+                WHERE latest.phone = message.phone
+            )
+            ORDER BY message.id DESC
+            LIMIT 200
+        """).fetchall()
+        return [dict(row) for row in rows]
+
+
+def _whatsapp_inbox_thread(phone):
+    with _inbox_connect() as db:
+        rows = db.execute("""
+            SELECT id, provider_message_id, phone, direction, text, status, created_at
+            FROM whatsapp_inbox_messages
+            WHERE phone = ?
+            ORDER BY id DESC
+            LIMIT 300
+        """, (_digits(phone),)).fetchall()
+        return [dict(row) for row in reversed(rows)]
+
+
 def extract_telegram_sender_and_message(payload):
     """Extrae (chat_id, texto) del payload entrante de Telegram.
 
@@ -1135,6 +1282,63 @@ def home():
     return jsonify({"status": "ok", "service": "paquetria-bot", "whatsapp": True, "telegram": True}), 200
 
 
+@app.route("/admin/inbox/conversations", methods=["GET"])
+def inbox_conversations():
+    auth_error = _inbox_authorization_error()
+    if auth_error:
+        return auth_error
+    try:
+        return jsonify({"conversations": _whatsapp_inbox_conversations()}), 200
+    except sqlite3.Error as exc:
+        print(f"[WA] error al leer conversaciones: {exc}", file=sys.stderr)
+        return jsonify({"error": "No se pudo leer la bandeja de mensajes."}), 500
+
+
+@app.route("/admin/inbox/conversations/<phone>", methods=["GET"])
+def inbox_thread(phone):
+    auth_error = _inbox_authorization_error()
+    if auth_error:
+        return auth_error
+    phone = _digits(phone)
+    if not re.fullmatch(r"\d{7,20}", phone):
+        return jsonify({"error": "El teléfono de la conversación no es válido."}), 400
+    try:
+        return jsonify({"messages": _whatsapp_inbox_thread(phone)}), 200
+    except sqlite3.Error as exc:
+        print(f"[WA] error al leer una conversación: {exc}", file=sys.stderr)
+        return jsonify({"error": "No se pudo leer esta conversación."}), 500
+
+
+@app.route("/admin/inbox/conversations/<phone>/reply", methods=["POST"])
+def inbox_reply(phone):
+    auth_error = _inbox_authorization_error()
+    if auth_error:
+        return auth_error
+    phone = _digits(phone)
+    if not re.fullmatch(r"\d{7,20}", phone):
+        return jsonify({"error": "El teléfono de la conversación no es válido."}), 400
+
+    data = request.get_json(silent=True) or {}
+    text = str(data.get("text") or "").strip()
+    if not text:
+        return jsonify({"error": "Escribe una respuesta."}), 400
+    if len(text) > 4096:
+        return jsonify({"error": "La respuesta no puede superar 4096 caracteres."}), 400
+
+    result = send_whatsapp_message(phone, text)
+    sent = bool(result.get("message_id"))
+    _store_whatsapp_inbox_message(
+        phone, "outbound", text,
+        provider_message_id=result.get("message_id"),
+        status="sent" if sent else "failed",
+    )
+    if not sent:
+        return jsonify({
+            "error": result.get("error") or "WhatsApp no confirmó el envío."
+        }), 502
+    return jsonify({"success": True}), 200
+
+
 # ----- WhatsApp (Meta) -----
 @app.route("/webhook", methods=["GET"])
 def verify_webhook():
@@ -1162,8 +1366,9 @@ def webhook():
         print(f"ERROR: JSON inválido en webhook: {exc}", file=sys.stderr)
         return jsonify({"status": "EVENT_RECEIVED"}), 200
 
-    # Ignora actualizaciones de estado y eventos sin mensaje de texto.
+    # Ignora estados, guarda medios recibidos y procesa automáticamente el texto.
     _log_whatsapp_event(data)
+    _store_nontext_whatsapp_messages(data)
     sender, user_text = extract_whatsapp_sender_and_message(data)
     if sender is None or user_text is None:
         return jsonify({"status": "EVENT_RECEIVED"}), 200
@@ -1172,6 +1377,10 @@ def webhook():
     if not _claim_whatsapp_message(message_id):
         print(f"[WA] evento duplicado ignorado id=...{message_id[-12:]}")
         return jsonify({"status": "EVENT_RECEIVED"}), 200
+
+    _store_whatsapp_inbox_message(
+        sender, "inbound", user_text, provider_message_id=message_id or None
+    )
 
     # La identidad de WhatsApp se valida únicamente con el teléfono del cliente,
     # nunca con el teléfono del destinatario.
@@ -1194,7 +1403,12 @@ def webhook():
     if not reply:
         reply = _general_help_reply()
 
-    send_whatsapp_message(sender, reply)
+    send_result = send_whatsapp_message(sender, reply)
+    _store_whatsapp_inbox_message(
+        sender, "outbound", reply,
+        provider_message_id=send_result.get("message_id"),
+        status="sent" if send_result.get("message_id") else "failed",
+    )
     _complete_whatsapp_message(message_id)
 
     return jsonify({"status": "EVENT_RECEIVED"}), 200
